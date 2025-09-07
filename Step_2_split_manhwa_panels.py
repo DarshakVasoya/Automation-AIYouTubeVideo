@@ -4,44 +4,7 @@ import numpy as np
 from PIL import Image
 from Step_1_downloadingimages import fetch_one_chapter
 
-def split_manhwa_panels(pil_img, min_gap_height=30):
-    # Convert to grayscale (OpenCV needs NumPy)
-    img = np.array(pil_img.convert("L"))
-
-    # Normalize brightness
-    _, thresh = cv2.threshold(img, 250, 255, cv2.THRESH_BINARY)
-
-    # Sum pixel values row by row (horizontal projection)
-    row_sums = np.sum(thresh == 255, axis=1)
-
-    # Find gaps where most pixels are white
-    gaps = []
-    in_gap = False
-    for i, val in enumerate(row_sums):
-        if val > 0.95 * thresh.shape[1]:  # row is ~95% white
-            if not in_gap:
-                start = i
-                in_gap = True
-        else:
-            if in_gap:
-                end = i
-                if end - start > min_gap_height:
-                    gaps.append((start, end))
-                in_gap = False
-
-    # Split panels between gaps
-    panels = []
-    last_cut = 0
-    for (start, end) in gaps:
-        panel = pil_img.crop((0, last_cut, pil_img.width, start))
-        if panel.height > 50:  # filter small cuts
-            panels.append(panel)
-        last_cut = end
-
-    # Final panel (bottom part)
-    if last_cut < pil_img.height:
-        panel = pil_img.crop((0, last_cut, pil_img.width, pil_img.height))
-        panels.append(panel)
+def split_manhwa_panels(pil_img):
 
     return panels
 
