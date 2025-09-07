@@ -2,79 +2,162 @@ import os
 import cv2
 import numpy as np
 from PIL import Image
-from Step_1_downloadingimages import fetch_one_chapter
+from downloadingimages import fetch_one_chapter
 
-def split_manhwa_panels(pil_img, min_gap_height=30):
-   
 
-    # Convert PIL image to OpenCV format
-    img = np.array(pil_img)
-    if img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+def split_manhwa_panels(
+    pil_img: Image.Image,
+    min_panel_height: int = 80,
+    min_panel_width: int = 80,
+    canny1: int = 50,
+    canny2: int = 150,
+    morph_kernel: int = 5,
+    dilate_iters: int = 2,
+) -> list[Image.Image]:
+    """Detect and crop panel regions from a tall manhwa page.
 
-    # Binarize image (invert so panels are white, borders are black)
-    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    Approach (robust for vertical-scroll pages):
+      1) Convert to grayscale, mild blur.
+      2) Canny edges -> dilate to close gaps in panel borders.
+      3) Find contours, keep large rectangular-like areas.
+      4) Sort by top-to-bottom, then left-to-right.
 
-    # Sum pixels along horizontal axis to find horizontal gaps
-    horizontal_sum = np.sum(thresh, axis=1)
-    gaps = []
-    in_gap = False
-    for i, val in enumerate(horizontal_sum):
-        if val < 10 and not in_gap:
-            gap_start = i
-            in_gap = True
-        elif val >= 10 and in_gap:
-            gap_end = i
-            if gap_end - gap_start > min_gap_height:
-                gaps.append((gap_start, gap_end))
-            in_gap = False
-    # Add last gap if image ends with a gap
-    if in_gap:
-        gap_end = len(horizontal_sum)-1
-        if gap_end - gap_start > min_gap_height:
-            gaps.append((gap_start, gap_end))
+    Returns a list of PIL Images for panels in reading order.
+    """
 
-    # Use gaps to determine panel boundaries
-    panel_bounds = []
-    last = 0
-    for gap_start, gap_end in gaps:
-        if gap_start - last > 20:
-            panel_bounds.append((last, gap_start))
-        last = gap_end
-    if last < img.shape[0]-1:
-        panel_bounds.append((last, img.shape[0]-1))
+    # Convert PIL image to OpenCV BGR
+    img_rgb = np.array(pil_img.convert("RGB"))
+    img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    h, w = img.shape[:2]
 
-    # Crop panels
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(gray, canny1, canny2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_kernel, morph_kernel))
+    dilated = cv2.dilate(edges, kernel, iterations=dilate_iters)
+
+    cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     panels = []
-    for top, bottom in panel_bounds:
-        panel_img = pil_img.crop((0, top, pil_img.width, bottom))
-        # Filter out very small panels
-        if panel_img.height > 40:
-            panels.append(panel_img)
+    boxes = []
+    for c in cnts:
+        x, y, cw, ch = cv2.boundingRect(c)
+        # Filter out tiny regions and near-border noise
+        if cw < min_panel_width or ch < min_panel_height:
+            continue
+
+        # Optional: expand a bit to include full panel area
+        pad = 6
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(w, x + cw + pad)
+        y1 = min(h, y + ch + pad)
+
+        boxes.append((y0, x0, y1, x1))  # store as (top, left, bottom, right)
+
+    if not boxes:
+        # Fallback: split by horizontal gaps (old approach)
+        gray2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray2, 240, 255, cv2.THRESH_BINARY_INV)
+        horizontal_sum = np.sum(thresh, axis=1)
+        gaps = []
+        in_gap = False
+        gap_start = 0
+        for i, val in enumerate(horizontal_sum):
+            if val < 10 and not in_gap:
+                gap_start = i
+                in_gap = True
+            elif val >= 10 and in_gap:
+                gap_end = i
+                if gap_end - gap_start > 30:
+                    gaps.append((gap_start, gap_end))
+                in_gap = False
+        if in_gap:
+            gap_end = len(horizontal_sum) - 1
+            if gap_end - gap_start > 30:
+                gaps.append((gap_start, gap_end))
+
+        last = 0
+        for gs, ge in gaps:
+            if gs - last > 20:
+                boxes.append((last, 0, gs, w))
+            last = ge
+        if last < h - 1:
+            boxes.append((last, 0, h - 1, w))
+
+    # Merge overlapping/contained boxes to avoid duplicates
+    boxes = _merge_boxes(boxes)
+
+    # Sort reading order: top-to-bottom, then left-to-right within bands
+    boxes.sort(key=lambda b: (b[0], b[1]))
+
+    for top, left, bottom, right in boxes:
+        crop = pil_img.crop((left, top, right, bottom))
+        if crop.width >= min_panel_width and crop.height >= min_panel_height:
+            panels.append(crop)
+
     return panels
 
+
+def _merge_boxes(boxes: list[tuple[int, int, int, int]], iou_thresh: float = 0.3) -> list[tuple[int, int, int, int]]:
+    if not boxes:
+        return []
+    # Simple NMS-like merge by removing boxes largely contained in others
+    boxes = sorted(boxes, key=lambda b: (-(b[2]-b[0]) * (b[3]-b[1])))  # larger first
+    kept = []
+    for b in boxes:
+        keep = True
+        for kb in kept:
+            if _iou(b, kb) > iou_thresh or _is_contained(b, kb):
+                keep = False
+                break
+        if keep:
+            kept.append(b)
+    return kept
+
+
+def _iou(a, b):
+    ay0, ax0, ay1, ax1 = a
+    by0, bx0, by1, bx1 = b
+    inter_left = max(ax0, bx0)
+    inter_top = max(ay0, by0)
+    inter_right = min(ax1, bx1)
+    inter_bottom = min(ay1, by1)
+    if inter_right <= inter_left or inter_bottom <= inter_top:
+        return 0.0
+    inter = (inter_right - inter_left) * (inter_bottom - inter_top)
+    a_area = (ax1 - ax0) * (ay1 - ay0)
+    b_area = (bx1 - bx0) * (by1 - by0)
+    return inter / float(a_area + b_area - inter + 1e-6)
+
+
+def _is_contained(a, b, pad: int = 4):
+    ay0, ax0, ay1, ax1 = a
+    by0, bx0, by1, bx1 = b
+    return ax0 >= bx0 - pad and ay0 >= by0 - pad and ax1 <= bx1 + pad and ay1 <= by1 + pad
+
+
 def save_panels(chapter_num, page_index, panels, output_dir="output"):
-    # Create chapter folder if not exists
     chapter_folder = os.path.join(output_dir, f"chapter_{chapter_num}")
     os.makedirs(chapter_folder, exist_ok=True)
-
-    # Save each panel
     for i, panel in enumerate(panels, start=1):
         filename = f"page_{page_index:02d}_panel_{i:02d}.png"
         path = os.path.join(chapter_folder, filename)
         panel.save(path, format="PNG")
         print(f"✅ Saved {path}")
-        
-        
-chapter_images = fetch_one_chapter(
-    "https://kingofshojo.com/manga/after-the-school-belle-dumped-me-i-became-a-martial-arts-god/",
-    "Chapter 1"
-)
-        
-# Example
-panels = split_manhwa_panels(chapter_images[1])
-print(f"Split into {len(panels)} panels")
 
 
-save_panels(chapter_num=1, page_index=1, panels=panels)
+if __name__ == "__main__":
+    # Fetch one page to test
+    chapter_images = fetch_one_chapter(
+        "https://kingofshojo.com/manga/after-the-school-belle-dumped-me-i-became-a-martial-arts-god/",
+        "Chapter 1",
+    )
+
+    # Process first page as demo
+    page_idx = 1
+    pil_page = chapter_images[page_idx]
+    panels = split_manhwa_panels(pil_page)
+    print(f"Split into {len(panels)} panels")
+    save_panels(chapter_num=1, page_index=page_idx, panels=panels)
