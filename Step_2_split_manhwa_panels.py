@@ -5,44 +5,53 @@ from PIL import Image
 from Step_1_downloadingimages import fetch_one_chapter
 
 def split_manhwa_panels(pil_img, min_gap_height=30):
-    # Convert to grayscale (OpenCV needs NumPy)
-    img = np.array(pil_img.convert("L"))
+   
 
-    # Normalize brightness
-    _, thresh = cv2.threshold(img, 250, 255, cv2.THRESH_BINARY)
+    # Convert PIL image to OpenCV format
+    img = np.array(pil_img)
+    if img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    # Sum pixel values row by row (horizontal projection)
-    row_sums = np.sum(thresh == 255, axis=1)
+    # Binarize image (invert so panels are white, borders are black)
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
 
-    # Find gaps where most pixels are white
+    # Sum pixels along horizontal axis to find horizontal gaps
+    horizontal_sum = np.sum(thresh, axis=1)
     gaps = []
     in_gap = False
-    for i, val in enumerate(row_sums):
-        if val > 0.95 * thresh.shape[1]:  # row is ~95% white
-            if not in_gap:
-                start = i
-                in_gap = True
-        else:
-            if in_gap:
-                end = i
-                if end - start > min_gap_height:
-                    gaps.append((start, end))
-                in_gap = False
+    for i, val in enumerate(horizontal_sum):
+        if val < 10 and not in_gap:
+            gap_start = i
+            in_gap = True
+        elif val >= 10 and in_gap:
+            gap_end = i
+            if gap_end - gap_start > min_gap_height:
+                gaps.append((gap_start, gap_end))
+            in_gap = False
+    # Add last gap if image ends with a gap
+    if in_gap:
+        gap_end = len(horizontal_sum)-1
+        if gap_end - gap_start > min_gap_height:
+            gaps.append((gap_start, gap_end))
 
-    # Split panels between gaps
+    # Use gaps to determine panel boundaries
+    panel_bounds = []
+    last = 0
+    for gap_start, gap_end in gaps:
+        if gap_start - last > 20:
+            panel_bounds.append((last, gap_start))
+        last = gap_end
+    if last < img.shape[0]-1:
+        panel_bounds.append((last, img.shape[0]-1))
+
+    # Crop panels
     panels = []
-    last_cut = 0
-    for (start, end) in gaps:
-        panel = pil_img.crop((0, last_cut, pil_img.width, start))
-        if panel.height > 50:  # filter small cuts
-            panels.append(panel)
-        last_cut = end
-
-    # Final panel (bottom part)
-    if last_cut < pil_img.height:
-        panel = pil_img.crop((0, last_cut, pil_img.width, pil_img.height))
-        panels.append(panel)
-
+    for top, bottom in panel_bounds:
+        panel_img = pil_img.crop((0, top, pil_img.width, bottom))
+        # Filter out very small panels
+        if panel_img.height > 40:
+            panels.append(panel_img)
     return panels
 
 def save_panels(chapter_num, page_index, panels, output_dir="output"):
@@ -64,7 +73,7 @@ chapter_images = fetch_one_chapter(
 )
         
 # Example
-panels = split_manhwa_panels(chapter_images[0])
+panels = split_manhwa_panels(chapter_images[1])
 print(f"Split into {len(panels)} panels")
 
 
